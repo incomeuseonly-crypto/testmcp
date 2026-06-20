@@ -1,0 +1,160 @@
+import { readFileSync } from "fs";
+import { createServer } from "http";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { RESOURCE_MIME_TYPE, RESOURCE_URI_META_KEY } from "@modelcontextprotocol/ext-apps";
+import { z } from "zod";
+
+const todoHtml = readFileSync("public/todo-widget.html", "utf8");
+
+let todos = [];
+let nextId = 1;
+
+const replyWithTodos = (message) => ({
+  content: message ? [{ type: "text", text: message }] : [],
+  structuredContent: { tasks: todos },
+});
+
+function createTodoServer() {
+  const server = new McpServer({ name: "todo-app", version: "0.1.0" });
+
+  // Register the UI resource
+  server.resource("todo-widget", "ui://widget/todo.html", async () => ({
+    contents: [
+      {
+        uri: "ui://widget/todo.html",
+        mimeType: RESOURCE_MIME_TYPE,
+        text: todoHtml,
+      },
+    ],
+  }));
+
+  // Register add_todo tool
+  server.tool(
+    "add_todo",
+    {
+      title: "Add todo",
+      description: "Creates a todo item with the given title.",
+      inputSchema: { title: z.string().min(1) },
+      outputSchema: {
+        tasks: z.array(
+          z.object({
+            id: z.string(),
+            title: z.string(),
+            completed: z.boolean(),
+          })
+        ),
+      },
+      annotations: {
+        [RESOURCE_URI_META_KEY]: "ui://widget/todo.html",
+      },
+    },
+    async (args) => {
+      const title = args?.title?.trim?.() ?? "";
+      if (!title) return replyWithTodos("Missing title.");
+      const todo = { id: `todo-${nextId++}`, title, completed: false };
+      todos = [...todos, todo];
+      return replyWithTodos(`Added "${todo.title}".`);
+    }
+  );
+
+  // Register complete_todo tool
+  server.tool(
+    "complete_todo",
+    {
+      title: "Complete todo",
+      description: "Marks a todo as done by id.",
+      inputSchema: { id: z.string().min(1) },
+      outputSchema: {
+        tasks: z.array(
+          z.object({
+            id: z.string(),
+            title: z.string(),
+            completed: z.boolean(),
+          })
+        ),
+      },
+      annotations: {
+        [RESOURCE_URI_META_KEY]: "ui://widget/todo.html",
+      },
+    },
+    async (args) => {
+      const id = args?.id;
+      if (!id) return replyWithTodos("Missing todo id.");
+      const todo = todos.find((task) => task.id === id);
+      if (!todo) {
+        return replyWithTodos(`Todo ${id} was not found.`);
+      }
+      todos = todos.map((task) =>
+        task.id === id ? { ...task, completed: true } : task
+      );
+      return replyWithTodos(`Completed "${todo.title}".`);
+    }
+  );
+
+  return server;
+}
+
+const port = Number(process.env.PORT ?? 8787);
+const MCP_PATH = "/mcp";
+
+const httpServer = createServer(async (req, res) => {
+  if (!req.url) {
+    res.writeHead(400).end("Missing URL");
+    return;
+  }
+
+  const url = new URL(req.url, `http://${req.headers.host ?? "localhost"}`);
+
+  if (req.method === "OPTIONS" && url.pathname === MCP_PATH) {
+    res.writeHead(204, {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+      "Access-Control-Allow-Headers": "content-type, mcp-session-id",
+      "Access-Control-Expose-Headers": "Mcp-Session-Id",
+    });
+    res.end();
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/") {
+    res.writeHead(200, { "content-type": "text/plain" }).end("Todo MCP server");
+    return;
+  }
+
+  const MCP_METHODS = new Set(["POST", "GET", "DELETE"]);
+  if (url.pathname === MCP_PATH && req.method && MCP_METHODS.has(req.method)) {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
+
+    const server = createTodoServer();
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined,
+      enableJsonResponse: true,
+    });
+
+    res.on("close", () => {
+      transport.close();
+      server.close();
+    });
+
+    try {
+      await server.connect(transport);
+      await transport.handleRequest(req, res);
+    } catch (error) {
+      console.error("Error handling MCP request:", error);
+      if (!res.headersSent) {
+        res.writeHead(500).end("Internal server error");
+      }
+    }
+    return;
+  }
+
+  res.writeHead(404).end("Not Found");
+});
+
+httpServer.listen(port, () => {
+  console.log(
+    `Todo MCP server listening on http://localhost:${port}${MCP_PATH}`
+  );
+});
